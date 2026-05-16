@@ -122,6 +122,7 @@ AUTO_ROI_MARGIN_FRACTION = 0.08
 AUTO_ROI_MAX_OVERLAP_IOU = 0.20
 AUTO_ROI_MIN_CONTRAST = 4.0
 AUTO_ROI_MAX_SATURATION = 0.35
+MAX_ROI_IOU = 0.15
 
 ROI = tuple[int, int, int, int]
 
@@ -306,6 +307,33 @@ def normalize_rois(rois) -> list[ROI]:
             clean.append((int(x), int(y), int(w), int(h)))
 
     return clean
+
+
+def roi_iou(roi_a, roi_b) -> float:
+    ax, ay, aw, ah = roi_a
+    bx, by, bw, bh = roi_b
+
+    ax1, ay1 = ax + aw, ay + ah
+    bx1, by1 = bx + bw, by + bh
+
+    inter_x0 = max(ax, bx)
+    inter_y0 = max(ay, by)
+    inter_x1 = min(ax1, bx1)
+    inter_y1 = min(ay1, by1)
+
+    inter_w = max(0, inter_x1 - inter_x0)
+    inter_h = max(0, inter_y1 - inter_y0)
+    inter_area = inter_w * inter_h
+
+    area_a = aw * ah
+    area_b = bw * bh
+
+    union_area = area_a + area_b - inter_area
+
+    if union_area <= 0:
+        return 0.0
+
+    return inter_area / union_area
 
 
 def resize_for_display(frame: np.ndarray, max_width: int = MAX_DISPLAY_WIDTH) -> np.ndarray:
@@ -533,10 +561,11 @@ def auto_select_rois(
 
     Selection logic:
     1. Generate grid candidates.
-    2. Rank candidates by contrast + edge content + Laplacian variance.
+    2. Score candidates by contrast + edge content + Laplacian variance.
     3. Prefer usable candidates.
-    4. Keep non-overlapping top boxes.
-    5. Fall back to the best available boxes if the frame is extremely blurred.
+    4. Select high-quality boxes while rejecting strong overlaps.
+    5. If too few non-overlapping boxes are found, relax the overlap rule.
+    6. If still too few, fill with the best remaining candidates.
     """
     candidates = generate_candidate_rois(
         frame,
@@ -544,35 +573,94 @@ def auto_select_rois(
         grid_cols=grid_cols,
     )
 
-    scored = [roi_quality(frame, roi) for roi in candidates]
+    scored_candidates = [roi_quality(frame, roi) for roi in candidates]
 
-    usable = [item for item in scored if item["usable"]]
-    pool = usable if len(usable) >= max(1, roi_count // 2) else scored
-    pool = sorted(pool, key=lambda item: item["quality"], reverse=True)
+    # Sort all candidates from best to worst
+    sorted_candidates = sorted(
+        scored_candidates,
+        key=lambda item: item["quality"],
+        reverse=True,
+    )
 
-    selected: list[ROI] = []
-    for item in pool:
-        roi = item["roi"]
+    # Prefer usable candidates, but keep all candidates as fallback
+    usable_candidates = [
+        item for item in sorted_candidates
+        if item["usable"]
+    ]
 
-        if all(roi_iou(roi, chosen) <= AUTO_ROI_MAX_OVERLAP_IOU for chosen in selected):
-            selected.append(roi)
+    if len(usable_candidates) >= max(1, roi_count // 2):
+        primary_pool = usable_candidates
+    else:
+        primary_pool = sorted_candidates
 
-        if len(selected) >= roi_count:
-            break
+    selected_rois: list[ROI] = []
 
-    # If non-overlap filtering is too strict for a small image, fill the rest
-    # using highest-quality remaining candidates.
-    if len(selected) < roi_count:
-        for item in pool:
-            roi = item["roi"]
-            if roi not in selected:
-                selected.append(roi)
+    def already_selected(candidate_roi: ROI) -> bool:
+        return candidate_roi in selected_rois
 
-            if len(selected) >= roi_count:
+    def add_non_overlapping_from_pool(pool, max_iou: float):
+        """
+        Add candidates from pool if they do not overlap too much
+        with already selected ROIs.
+        """
+        nonlocal selected_rois
+
+        for candidate in pool:
+            candidate_roi = candidate["roi"]
+
+            if already_selected(candidate_roi):
+                continue
+
+            overlaps_existing = any(
+                roi_iou(candidate_roi, existing_roi) > max_iou
+                for existing_roi in selected_rois
+            )
+
+            if overlaps_existing:
+                continue
+
+            selected_rois.append(candidate_roi)
+
+            if len(selected_rois) >= roi_count:
                 break
 
-    print(f"Auto-selected {len(selected)} ROI(s).")
-    return selected
+    # Pass 1: strict non-overlap, using preferred pool
+    add_non_overlapping_from_pool(
+        primary_pool,
+        max_iou=AUTO_ROI_MAX_OVERLAP_IOU,
+    )
+
+    # Pass 2: strict non-overlap, using all candidates
+    if len(selected_rois) < roi_count:
+        add_non_overlapping_from_pool(
+            sorted_candidates,
+            max_iou=AUTO_ROI_MAX_OVERLAP_IOU,
+        )
+
+    # Pass 3: relaxed overlap, useful when features are dense or image is small
+    if len(selected_rois) < roi_count:
+        relaxed_iou = max(0.35, AUTO_ROI_MAX_OVERLAP_IOU * 2.5)
+
+        add_non_overlapping_from_pool(
+            sorted_candidates,
+            max_iou=relaxed_iou,
+        )
+
+    # Pass 4: final fallback, fill with best remaining boxes even if overlapping
+    if len(selected_rois) < roi_count:
+        for candidate in sorted_candidates:
+            candidate_roi = candidate["roi"]
+
+            if already_selected(candidate_roi):
+                continue
+
+            selected_rois.append(candidate_roi)
+
+            if len(selected_rois) >= roi_count:
+                break
+
+    print(f"Auto-selected {len(selected_rois)} ROI(s).")
+    return selected_rois
 
 
 def calculate_multi_roi_focus_score(frame: np.ndarray, rois) -> float:
