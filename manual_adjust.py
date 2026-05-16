@@ -59,7 +59,7 @@ CONSECUTIVE_GOOD_REQUIRED = 2
 # the sharpness score is less meaningful.
 MIN_MEAN_BRIGHTNESS = 10.0
 MAX_MEAN_BRIGHTNESS = 240.0
-MAX_SATURATION_FRACTION = 0.02  # fraction of pixels at/near 255
+MAX_SATURATION_FRACTION = 0.2  # fraction of pixels at/near 255
 
 # Display settings
 MAX_DISPLAY_WIDTH = 1280
@@ -69,10 +69,15 @@ WINDOW_NAME = "Manual focus assistant"
 READ_PROMPT_TIMEOUT = 5.0
 ADJUSTMENT_TIMEOUT = 5.0
 POST_CAPTURE_DELAY = 1.0
+LIVE_CAPTURE_INTERVAL = 0.5
 
 # Capture settings
 WARMUP_FRAMES = 3
 CAPTURE_TIMEOUT = 10.0
+
+# Sensitivity settings
+PROMPT_REL_EPSILON = 0.005
+PROMPT_ABS_EPSILON = 0.5
 
 
 # =========================
@@ -245,21 +250,21 @@ def save_frame(frame: np.ndarray, metrics: FrameMetrics, label: str = "accepted"
     return path
 
 
-def make_prompt(previous_score: float | None, current_score: float, last_move: str | None = None) -> str:
+def make_prompt(previous_score: float | None, current_score: float) -> str:
     """Generate a manual focusing prompt from score trend."""
     if previous_score is None:
-        return "Initial frame captured. Adjust focus slightly, then capture again."
+        return "Baseline captured. Adjust the focus screw/platform slightly."
 
     delta = current_score - previous_score
-    relative = delta / max(abs(previous_score), 1.0)
+    threshold = max(PROMPT_ABS_EPSILON, PROMPT_REL_EPSILON * abs(previous_score))
 
-    if abs(relative) < 0.03:
-        return "Focus score changed little. Try a smaller adjustment or improve illumination."
+    if abs(delta) < threshold:
+        return "Focus changed only slightly. Continue slowly and watch for a peak."
 
     if delta > 0:
-        return "Focus improved. Continue in the same direction for the next adjustment."
+        return "Focus improved. Continue in the same direction, but use smaller steps."
 
-    return "Focus worsened. Reverse the direction for the next adjustment."
+    return "Focus worsened. You may have passed the focal point; reverse slightly."
 
 
 # =========================
@@ -303,6 +308,64 @@ def capture_frame(hcam, width: int, height: int) -> np.ndarray:
         timeout=CAPTURE_TIMEOUT,
     )
     return ct.buffer_to_frame(buffer, frame_w, frame_h, row_pitch)
+
+
+def live_adjust_capture(hcam, width: int, height: int, previous_score: float | None, good_count: int):
+    """
+    During the manual adjustment window, repeatedly capture frames and keep
+    the best valid frame. This reduces the chance of missing the focal point.
+    """
+    best_frame = None
+    best_metrics = None
+
+    latest_frame = None
+    latest_metrics = None
+
+    start = time.time()
+    next_capture_time = 0.0
+
+    while True:
+        elapsed = time.time() - start
+        remaining = max(0.0, ADJUSTMENT_TIMEOUT - elapsed)
+
+        if elapsed >= ADJUSTMENT_TIMEOUT:
+            break
+
+        now = time.time()
+
+        if now >= next_capture_time:
+            latest_frame = capture_frame(hcam, width, height)
+            latest_metrics = analyze_frame(latest_frame)
+
+            # Only let brightness-valid frames compete for "best focus".
+            if latest_metrics.good_brightness:
+                if best_metrics is None or latest_metrics.score > best_metrics.score:
+                    best_frame = latest_frame
+                    best_metrics = latest_metrics
+
+            # If no valid-brightness frame exists yet, still show something.
+            if best_frame is None:
+                best_frame = latest_frame
+                best_metrics = latest_metrics
+
+            next_capture_time = now + LIVE_CAPTURE_INTERVAL
+
+        if latest_frame is not None and latest_metrics is not None:
+            prompt = make_prompt(previous_score, latest_metrics.score)
+            prompt = f"Live adjusting: {prompt} Best score this round: {best_metrics.score:.2f} ({remaining:.1f}s)"
+            display = draw_overlay(latest_frame, latest_metrics, prompt, good_count)
+            cv2.imshow(WINDOW_NAME, display)
+
+        key = cv2.waitKey(50) & 0xFF
+
+        if key == ord("q"):
+            return best_frame, best_metrics, "q"
+
+        if key == ord("s") and latest_frame is not None and latest_metrics is not None:
+            path = save_frame(latest_frame, latest_metrics, label="manual_save")
+            print("Manual save:", path)
+
+    return best_frame, best_metrics, None
 
 
 # =========================
@@ -381,19 +444,20 @@ def main():
                 path = save_frame(current_frame, current_metrics, label="manual_save")
                 print("Manual save:", path)
 
-           # 2. Give time to physically adjust focus screw/platform.
-            action = wait_with_preview(
-                current_frame,
-                current_metrics,
-                "Adjust focus screw/platform now.",
+           # 2. Live feedback while physically adjusting the focus screw/platform.
+            new_frame, new_metrics, live_action = live_adjust_capture(
+                hcam,
+                width,
+                height,
+                previous_score,
                 good_count,
-                ADJUSTMENT_TIMEOUT,
             )
-            if action == "q":
+            
+            if live_action == "q":
                 break
-            if action == "s" and current_metrics is not None:
-                path = save_frame(current_frame, current_metrics, label="manual_save")
-                print("Manual save:", path)
+            if new_frame is None or new_metrics is None:
+                print("No frame captured during live adjustment. Retrying capture...")
+                continue
 
             # 3. Capture a new frame after manual adjustment.
             new_frame = capture_frame(hcam, width, height)
