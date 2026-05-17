@@ -13,9 +13,7 @@ Features:
 - Shows live video with selected ROI boxes drawn on screen
 - Draws a small rolling focus-score chart inside the display window
 - Turns the rolling focus line from red to green when repeated good frames are reached
-- Press "a" to auto-reselect ROIs during focusing
-- Press "r" to reset the best score
-- Press "q" to quit
+- Press "a" to auto-reselect ROIs during focusing, "r" to reset the best score, "q" to quit
 
 Notes:
 - Use --backend litocam for cameras seen by LitoDigital.
@@ -40,22 +38,66 @@ import numpy as np
 # User-adjustable settings
 # ============================================================
 
-FOCUS_TARGETS = {
-    "5x": 875.0,
-    "10x": 480.0,
-    "20x": 210.0,
-    "50x": 75.0,
-    "100x": 60.0,
+FOCUS_TARGETS_BY_BACKEND = {
+    "litocam": {
+        "5x": 875.0,
+        "10x": 480.0,
+        "20x": 210.0,
+        "50x": 75.0,
+        "100x": 60.0,
+    },
+    "opencv": {
+        "5x": 415.0,
+        "10x": 225.0,
+        "20x": 100.0,
+        "50x": 35.0,
+        "100x": 25.0,
+    },
 }
 
-MAX_DISPLAY_WIDTH = 1280
+
+def get_focus_target(
+    magnification: str,
+    backend_name: str,
+    override: float | None = None,
+) -> float:
+    """
+    Select focus target based on the actual camera backend.
+
+    The same microscope magnification can give different Laplacian scores
+    depending on camera, lens, resolution, exposure, and backend.
+    """
+    if override is not None:
+        return float(override)
+
+    backend_name = backend_name.lower()
+
+    if backend_name not in FOCUS_TARGETS_BY_BACKEND:
+        raise ValueError(
+            f"Unsupported backend for focus targets: {backend_name}. "
+            f"Choose from {list(FOCUS_TARGETS_BY_BACKEND.keys())}."
+        )
+
+    targets = FOCUS_TARGETS_BY_BACKEND[backend_name]
+
+    if magnification not in targets:
+        raise ValueError(
+            f"Unsupported magnification {magnification} for backend {backend_name}. "
+            f"Choose from {list(targets.keys())}."
+        )
+
+    return targets[magnification]
+
+
+IMAGE_DISPLAY_WIDTH = 850
+PANEL_WIDTH = 430
 WINDOW_NAME = "Semi-auto Live Focus Feedback"
 ROI_SELECT_WINDOW = "Select ROI -> Press Enter"
 
 WARMUP_FRAMES = 3
 CAPTURE_TIMEOUT = 10.0
 
-CONSECUTIVE_GOOD_REQUIRED = 2
+CONSECUTIVE_GOOD_REQUIRED = 10
 BAD_FRAMES_TO_RESET = 2
 
 MIN_ROI_MEAN_BRIGHTNESS = 10.0
@@ -101,8 +143,8 @@ def load_litocam_backend():
     litocam.dll or the LitoDigital installation is unavailable.
     """
     candidate_module_names = [
-        "camera_test",
         "litocam_test",
+        "camera_test",
     ]
 
     last_error: Exception | None = None
@@ -516,15 +558,22 @@ def normalize_rois(rois) -> list[ROI]:
     return clean
 
 
-def resize_for_display(frame: np.ndarray, max_width: int = MAX_DISPLAY_WIDTH) -> np.ndarray:
+def resize_for_display(frame: np.ndarray, width: int = IMAGE_DISPLAY_WIDTH) -> np.ndarray:
+    """
+    Resize the live camera frame to a fixed display width.
+
+    This affects only the image area. The side dashboard panel is added later
+    in draw_dashboard().
+    """
     h, w = frame.shape[:2]
 
-    if w <= max_width:
+    if w <= 0 or h <= 0:
         return frame.copy()
 
-    scale = max_width / w
+    scale = width / w
     new_size = (int(w * scale), int(h * scale))
-    return cv2.resize(frame, new_size)
+
+    return cv2.resize(frame, new_size, interpolation=cv2.INTER_LINEAR)
 
 
 def crop_roi(frame: np.ndarray, roi):
@@ -1011,7 +1060,7 @@ class ConsecutiveFocusTracker:
             self.good_count = min(self.good_count + 1, self.required_good)
             self.bad_count = 0
         else:
-            self.bad_count += 1
+            self.bad_count = min(self.bad_count + 1, self.bad_to_reset)
 
             if self.bad_count >= self.bad_to_reset:
                 self.good_count = 0
@@ -1144,74 +1193,161 @@ def draw_dashboard(
     best_score: float,
     previous_ema_score: float | None,
     scores,
+    backend_name: str = "",
+    camera_label: str = "",
+    required_good: int = CONSECUTIVE_GOOD_REQUIRED,
 ):
-    display = resize_for_display(frame)
+    """
+    Build a stable side-panel dashboard.
+
+    Important display choices:
+    - The live image is kept clean; only ROI rectangles are drawn on it.
+    - Text, prompt, controls, and chart stay on the right-side panel.
+    - The prompt area has a fixed height, so the chart no longer jumps up/down
+      when the prompt changes between 2 and 3 lines.
+    """
+    # Left: live image
+    image = resize_for_display(frame, width=IMAGE_DISPLAY_WIDTH)
     roi_list = normalize_rois(rois)
-    draw_roi_rectangles(display, frame.shape, roi_list)
+    draw_roi_rectangles(image, frame.shape, roi_list)
+
+    image_h, _image_w = image.shape[:2]
+
+    # Right: dashboard panel
+    panel = np.full((image_h, PANEL_WIDTH, 3), 35, dtype=np.uint8)
 
     prompt = make_prompt(previous_ema_score, ema_score)
 
     whole_sat_warning = metrics["whole_saturation_fraction"] > FRAME_MAX_SATURATION_FRACTION
     status_text = "CLEAR" if is_clear else "ADJUSTING"
     status_color = (0, 180, 0) if is_clear else (0, 0, 255)
-
     roi_mode_text = f"{len(roi_list)} auto ROI(s)" if roi_list else "whole frame"
 
+    # ----------------------------
+    # Top status block
+    # ----------------------------
     lines = [
-        f"{magnification} | EMA focus: {ema_score:.2f} | Raw: {raw_score:.2f} | Target: {focus_target:.2f}",
-        f"Status: {status_text} | Good: {good_count}/{CONSECUTIVE_GOOD_REQUIRED} | Bad: {bad_count}",
-        f"Best score this run: {best_score:.2f} | Scoring: {roi_mode_text}",
+        f"Magnification: {magnification} | Scoring: {roi_mode_text}",
+        f"EMA: {ema_score:.2f} | Raw: {raw_score:.2f}",
+        f"Best: {best_score:.2f} | Target: {focus_target:.2f}",
+        f"Status: {status_text} | Good: {good_count}/{required_good}",
         f"Brightness OK: {metrics['brightness_ok']} | Focus OK: {metrics['focus_ok']}",
-        f"Source: {metrics['metric_source']}",
-        f"ROI median mean: {metrics['mean']:.1f}, min/max: {metrics['min']}/{metrics['max']}",
-        f"ROI/edge saturation median: {metrics['saturation_fraction']:.4f}",
-        f"Whole-frame saturation: {metrics['whole_saturation_fraction']:.4f}, warning = {whole_sat_warning}",
-        prompt,
-        "Keys: q quit | r reset best score | a auto-reselect ROIs",
+        f"ROI mean: {metrics['mean']:.1f} | ROI min/max: {metrics['min']}/{metrics['max']}",
+        f"ROI sat: {metrics['saturation_fraction']:.4f} | Frame sat: {metrics['whole_saturation_fraction']:.4f}",
+        f"Sat warning: {whole_sat_warning}",
     ]
 
-    x, y0 = 20, 30
-    line_gap = 25
+    x = 15
+    y = 30
+    line_gap = 24
 
-    overlay = display.copy()
-    cv2.rectangle(
-        overlay,
-        (10, 10),
-        (min(display.shape[1] - 10, 1250), 10 + line_gap * len(lines)),
-        (0, 0, 0),
-        -1,
-    )
-    display = cv2.addWeighted(overlay, 0.55, display, 0.45, 0)
-
-    for i, line in enumerate(lines):
-        y = y0 + i * line_gap
-
-        color = status_color if i == 1 else (255, 255, 255)
-
+    for line in lines:
+        color = status_color if line.startswith("Status") else (255, 255, 255)
         cv2.putText(
-            display,
+            panel,
             line,
             (x, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
+            0.58,
             color,
             2,
             cv2.LINE_AA,
         )
+        y += line_gap
 
-    display = draw_focus_chart(
-        display,
+    # ----------------------------
+    # Fixed-height prompt area
+    # ----------------------------
+    prompt_top = y + 14
+    prompt_line_gap = 22
+    prompt_max_lines = 3
+    prompt_max_chars = 38
+
+    prompt_words = prompt.split()
+    prompt_lines = []
+    current = ""
+
+    for word in prompt_words:
+        candidate = (current + " " + word).strip()
+        if len(candidate) > prompt_max_chars and current:
+            prompt_lines.append(current)
+            current = word
+        else:
+            current = candidate
+
+    if current:
+        prompt_lines.append(current)
+
+    # Draw at most three lines, but reserve exactly three lines of vertical space
+    # so the chart y-position is stable.
+    for i in range(prompt_max_lines):
+        line = prompt_lines[i] if i < len(prompt_lines) else ""
+        cv2.putText(
+            panel,
+            line,
+            (x, prompt_top + i * prompt_line_gap),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+    # ----------------------------
+    # Fixed-position chart area
+    # ----------------------------
+    controls_y = image_h - 54
+    backend_y = image_h - 24
+
+    chart_h = 165
+    preferred_chart_y = prompt_top + prompt_max_lines * prompt_line_gap + 28
+    max_chart_y = controls_y - chart_h - 28
+    chart_y = min(preferred_chart_y, max_chart_y)
+
+    # In very small windows, keep a usable chart and avoid negative y.
+    chart_y = max(prompt_top + prompt_max_lines * prompt_line_gap + 10, chart_y)
+    chart_y = min(chart_y, max(10, image_h - chart_h - 95))
+
+    panel = draw_focus_chart(
+        panel,
         scores=scores,
         threshold=focus_target,
         is_clear=is_clear,
-        x=20,
-        y=10 + line_gap * len(lines) + 15,
-        w=400,
-        h=155,
+        x=15,
+        y=chart_y,
+        w=PANEL_WIDTH - 30,
+        h=chart_h,
     )
 
-    return display
+    # ----------------------------
+    # Bottom controls and backend information
+    # ----------------------------
+    controls_text = "Keys: q quit | r reset best | a auto-ROIs"
+    cv2.putText(
+        panel,
+        controls_text,
+        (15, controls_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
+    bottom_text = f"Backend: {backend_name} | Camera: {camera_label}"
+    cv2.putText(
+        panel,
+        bottom_text[:52],
+        (15, backend_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    dashboard = np.hstack([image, panel])
+    return dashboard
 
 
 # ============================================================
@@ -1229,14 +1365,20 @@ def run_live_focus(
     frame_width: int | None = None,
     frame_height: int | None = None,
     litocam_configure: bool = True,
+    good_required: int = CONSECUTIVE_GOOD_REQUIRED,
+    focus_target_override: float | None = None,
 ):
-    if magnification not in FOCUS_TARGETS:
-        raise ValueError(f"Unsupported magnification {magnification}. Choose from {list(FOCUS_TARGETS)}")
+    valid_magnifications = set()
+    for targets in FOCUS_TARGETS_BY_BACKEND.values():
+        valid_magnifications.update(targets.keys())
+    
+    if magnification not in valid_magnifications:
+        raise ValueError(
+            f"Invalid magnification '{magnification}'." 
+            f"Valid options: {sorted(valid_magnifications)}")
 
     if roi_mode not in {"auto", "manual", "none"}:
         raise ValueError("roi_mode must be 'auto', 'manual', or 'none'.")
-
-    focus_target = FOCUS_TARGETS[magnification]
 
     camera: BaseCameraSession | None = None
 
@@ -1248,6 +1390,12 @@ def run_live_focus(
             frame_width=frame_width,
             frame_height=frame_height,
             litocam_configure=litocam_configure,
+        )
+
+        focus_target = get_focus_target(
+            magnification=magnification,
+            backend_name=camera.backend_name,
+            override=focus_target_override,
         )
 
         warmup_camera(camera, WARMUP_FRAMES)
@@ -1265,7 +1413,7 @@ def run_live_focus(
 
         scores = deque(maxlen=120)
         tracker = ConsecutiveFocusTracker(
-            required_good=CONSECUTIVE_GOOD_REQUIRED,
+            required_good=good_required,
             bad_to_reset=BAD_FRAMES_TO_RESET,
         )
 
@@ -1283,6 +1431,7 @@ def run_live_focus(
         print(f"Camera: {camera.name}")
         print(f"Magnification: {magnification}")
         print(f"Focus target: {focus_target:.2f}")
+        print(f"Required good frames: {good_required}")
         print(f"ROI mode: {roi_mode}")
         print(f"Selected ROI count: {len(rois)}")
 
@@ -1310,32 +1459,22 @@ def run_live_focus(
             scores.append(ema_score)
 
             display = draw_dashboard(
-                frame=frame,
-                rois=rois,
-                metrics=metrics,
-                ema_score=ema_score,
-                raw_score=raw_score,
-                focus_target=focus_target,
-                magnification=magnification,
-                good_count=good_count,
-                bad_count=bad_count,
-                is_clear=is_clear,
-                best_score=best_score,
-                previous_ema_score=previous_ema_score,
-                scores=scores,
-            )
-
-            # Add backend/camera label near the lower left.
-            backend_label = f"Backend: {camera.backend_name} | Camera: {camera.name}"
-            cv2.putText(
-                display,
-                backend_label,
-                (20, max(30, display.shape[0] - 25)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
+                frame = frame,
+                rois = rois,
+                metrics = metrics,
+                ema_score = ema_score,
+                raw_score = raw_score,
+                focus_target = focus_target,
+                magnification = magnification,
+                good_count = good_count,
+                bad_count = bad_count,
+                is_clear = is_clear,
+                best_score = best_score,
+                previous_ema_score = previous_ema_score,
+                scores = scores,
+                backend_name = camera.backend_name,
+                camera_label = camera.name,
+                required_good = good_required,
             )
 
             cv2.imshow(WINDOW_NAME, display)
@@ -1376,6 +1515,8 @@ def run_live_focus_litocam(
     target_fps: float = 10.0,
     roi_mode: str = "auto",
     auto_roi_count: int = AUTO_ROI_COUNT,
+    good_required: int = CONSECUTIVE_GOOD_REQUIRED,
+    focus_target_override: float | None = None,
 ):
     run_live_focus(
         backend="litocam",
@@ -1384,6 +1525,8 @@ def run_live_focus_litocam(
         target_fps=target_fps,
         roi_mode=roi_mode,
         auto_roi_count=auto_roi_count,
+        good_required=good_required,
+        focus_target_override=focus_target_override,
     )
 
 
@@ -1425,6 +1568,13 @@ if __name__ == "__main__":
         default="dshow",
         choices=["any", "dshow", "msmf"],
         help="OpenCV capture API to use when --backend opencv or auto fallback is used.",
+    )
+
+    parser.add_argument(
+        "--focus-target",
+        type=float,
+        default=None,
+        help="Override backend-specific focus target. Useful for calibration/testing.",
     )
 
     parser.add_argument(
@@ -1472,6 +1622,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--good-required",
+        type=int,
+        default=CONSECUTIVE_GOOD_REQUIRED,
+        help="Number of consecutive good frames required before status becomes CLEAR.",
+    )
+
+    parser.add_argument(
         "--no-roi",
         action="store_true",
         help="Backward-compatible shortcut for --roi-mode none.",
@@ -1498,4 +1655,6 @@ if __name__ == "__main__":
         frame_width=args.width,
         frame_height=args.height,
         litocam_configure=not args.skip_litocam_config,
+        good_required=args.good_required,
+        focus_target_override=args.focus_target,
     )
