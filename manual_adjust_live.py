@@ -1,26 +1,26 @@
 """
 manual_adjust_live.py
 
-Semi-automatic live focus feedback for the Litocam CMOS sensor.
-
-This version does NOT use cv2.VideoCapture(), because that opens normal webcams.
-Instead, it reuses the working Litocam SDK backend from camera_test.py.
+Semi-automatic live focus feedback compatible with both:
+- Litocam/LitoDigital cameras accessed through litocam.dll
+- normal Windows/OpenCV cameras accessed through cv2.VideoCapture
 
 Features:
-- Opens the Litocam CMOS camera through litocam.dll
-- Captures frames using SDK pull mode
+- Chooses camera backend with --backend litocam/opencv/auto
+- Captures frames from either backend through one common camera-session interface
 - Automatically selects several candidate ROIs across the field of view
 - Computes focus score as the median score over the selected ROIs
-- Shows live video with the selected ROI boxes drawn on screen
+- Shows live video with selected ROI boxes drawn on screen
 - Draws a small rolling focus-score chart inside the display window
 - Turns the rolling focus line from red to green when repeated good frames are reached
 - Press "a" to auto-reselect ROIs during focusing
 - Press "r" to reset the best score
 - Press "q" to quit
 
-Required:
-- camera_test.py in the same folder
-- LitoDigital closed before running
+Notes:
+- Use --backend litocam for cameras seen by LitoDigital.
+- Use --backend opencv for cameras seen by the Windows Camera app / OpenCV.
+- Use --backend auto to try Litocam first, then fall back to OpenCV.
 """
 
 from __future__ import annotations
@@ -32,47 +32,8 @@ import time
 from collections import deque
 from ctypes import byref, c_int
 from pathlib import Path
-
 import cv2
 import numpy as np
-
-
-# ============================================================
-# Import the working Litocam backend
-# ============================================================
-
-def load_camera_test_backend():
-    """
-    Prefer normal import:
-        import camera_test as ct
-
-    Fallback:
-        load camera_test(5).py if that is the local filename.
-    """
-    try:
-        import camera_test as ct
-        return ct
-    except ImportError:
-        script_dir = Path(__file__).resolve().parent
-        fallback_path = script_dir / "camera_test(5).py"
-
-        if not fallback_path.exists():
-            raise ImportError(
-                "Could not import camera_test.py. "
-                "Put this file in the same folder as camera_test.py, "
-                "or rename camera_test(5).py to camera_test.py."
-            )
-
-        spec = importlib.util.spec_from_file_location("camera_test_fallback", fallback_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load backend from {fallback_path}")
-
-        ct = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(ct)
-        return ct
-
-
-ct = load_camera_test_backend()
 
 
 # ============================================================
@@ -88,7 +49,7 @@ FOCUS_TARGETS = {
 }
 
 MAX_DISPLAY_WIDTH = 1280
-WINDOW_NAME = "Semi-auto Litocam Focus Feedback"
+WINDOW_NAME = "Semi-auto Live Focus Feedback"
 ROI_SELECT_WINDOW = "Select ROI -> Press Enter"
 
 WARMUP_FRAMES = 3
@@ -99,8 +60,8 @@ BAD_FRAMES_TO_RESET = 2
 
 MIN_ROI_MEAN_BRIGHTNESS = 10.0
 MAX_ROI_MEAN_BRIGHTNESS = 240.0
-EDGE_MAX_SATURATION_FRACTION = 0.20
-FRAME_MAX_SATURATION_FRACTION = 0.20
+EDGE_MAX_SATURATION_FRACTION = 0.25
+FRAME_MAX_SATURATION_FRACTION = 0.30
 
 CANNY_LOW_THRESHOLD = 50
 CANNY_HIGH_THRESHOLD = 150
@@ -127,133 +88,379 @@ MAX_ROI_IOU = 0.15
 ROI = tuple[int, int, int, int]
 
 
+
 # ============================================================
-# Quiet Litocam callback and frame capture
+# Camera backend abstraction
 # ============================================================
 
-@ct.CALLBACK_TYPE
-def quiet_event_callback(nEvent, pCallbackCtx):
+def load_litocam_backend():
     """
-    Same logic as camera_test.event_callback, but without printing every event.
-    Printing every callback would flood the terminal during live video.
+    Load the Litocam SDK wrapper only when it is actually needed.
+
+    This keeps the program usable with ordinary OpenCV/Windows cameras even when
+    litocam.dll or the LitoDigital installation is unavailable.
     """
-    if nEvent == ct.EVENT_IMAGE:
-        ct.image_ready.set()
+    candidate_module_names = [
+        "camera_test",
+        "litocam_test",
+    ]
 
+    last_error: Exception | None = None
 
-def open_litocam(camera_number: int = 0):
-    """
-    Open a Litocam CMOS camera through the SDK.
+    for module_name in candidate_module_names:
+        try:
+            module = __import__(module_name)
+            return module
+        except Exception as exc:
+            last_error = exc
 
-    camera_number refers to the index among Litocam SDK devices,
-    not cv2.VideoCapture webcam indices.
-    """
-    devices = (ct.LitocamDeviceV2 * ct.MAX_CAMERAS)()
-    count = ct.cam.Litocam_EnumV2(devices)
+    script_dir = Path(__file__).resolve().parent
+    candidate_files = [
+        script_dir / "camera_test.py",
+        script_dir / "litocam_test.py",
+        script_dir / "camera_test(5).py",
+        script_dir / "litocam_test(5).py",
+    ]
 
-    print("Number of Litocam cameras found:", count)
+    for path in candidate_files:
+        if not path.exists():
+            continue
 
-    if count == 0:
-        raise RuntimeError("No Litocam camera found. Close LitoDigital and check the USB connection.")
-
-    for i in range(count):
-        print(f"Camera {i}: {devices[i].displayname}, ID = {devices[i].id}")
-
-    if camera_number < 0 or camera_number >= count:
-        raise ValueError(f"Invalid Litocam camera number {camera_number}. Available: 0 to {count - 1}")
-
-    hcam = ct.cam.Litocam_Open(devices[camera_number].id)
-
-    if not hcam:
-        raise RuntimeError("Litocam_Open failed. Make sure LitoDigital is closed.")
-
-    width = c_int()
-    height = c_int()
-
-    hr = ct.cam.Litocam_get_Size(hcam, byref(width), byref(height))
-    ct.check_hr(hr, "Litocam_get_Size")
-
-    print("Opened Litocam:", devices[camera_number].displayname)
-    print("Image size:", width.value, "x", height.value)
-
-    return hcam, width.value, height.value
-
-
-def start_litocam_stream(hcam):
-    """
-    Configure camera exposure/gain and start SDK pull mode.
-    """
-    ct.configure_camera(hcam)
-
-    ct.image_ready.clear()
-
-    hr = ct.cam.Litocam_StartPullModeWithCallback(
-        hcam,
-        quiet_event_callback,
-        None,
-    )
-    ct.check_hr(hr, "Litocam_StartPullModeWithCallback")
-
-
-def quiet_pull_one_frame(hcam, width: int, height: int, timeout: float = CAPTURE_TIMEOUT) -> np.ndarray:
-    """
-    Pull one frame from the Litocam SDK without verbose printing.
-
-    This is a quieter version of camera_test.pull_one_frame().
-    """
-    bits = ct.BITS
-    row_pitch = ct.calc_row_pitch(width, bits)
-    buffer_size = row_pitch * height
-    buffer = (ctypes.c_ubyte * buffer_size)()
-
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        ct.image_ready.wait(timeout=0.5)
-        ct.image_ready.clear()
-
-        for _attempt in range(10):
-            info = ct.LitocamFrameInfoV2()
-
-            hr = ct.cam.Litocam_PullImageWithRowPitchV2(
-                hcam,
-                buffer,
-                bits,
-                row_pitch,
-                byref(info),
-            )
-
-            code = ct.hr32(hr)
-
-            if code == ct.S_OK:
-                return ct.buffer_to_frame(buffer, info.width, info.height, row_pitch)
-
-            if code == ct.E_PENDING:
-                time.sleep(0.01)
+        try:
+            spec = importlib.util.spec_from_file_location("litocam_backend", path)
+            if spec is None or spec.loader is None:
                 continue
 
-            raise RuntimeError(
-                f"Litocam_PullImageWithRowPitchV2 failed, HRESULT = {hex(code)}"
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception as exc:
+            last_error = exc
+
+    raise ImportError(
+        "Could not load a Litocam backend. Put camera_test.py or litocam_test.py "
+        "in the same folder, check the LitoDigital installation, or run with "
+        "--backend opencv for Windows/OpenCV cameras."
+    ) from last_error
+
+
+def opencv_api_preference(api_name: str) -> int:
+    """
+    Convert a readable API name into an OpenCV VideoCapture backend constant.
+    """
+    api_name = api_name.lower()
+
+    if api_name in {"any", "default"}:
+        return cv2.CAP_ANY
+
+    if api_name == "dshow":
+        return cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else cv2.CAP_ANY
+
+    if api_name == "msmf":
+        return cv2.CAP_MSMF if hasattr(cv2, "CAP_MSMF") else cv2.CAP_ANY
+
+    raise ValueError("opencv_api must be one of: any, dshow, msmf")
+
+
+class BaseCameraSession:
+    """
+    Small common interface used by the live focus loop.
+
+    Each camera backend only needs:
+    - open()
+    - capture_frame()
+    - close()
+    - name / width / height fields
+    """
+
+    backend_name = "base"
+
+    def __init__(self):
+        self.name = "unopened camera"
+        self.width: int | None = None
+        self.height: int | None = None
+
+    def open(self):
+        raise NotImplementedError
+
+    def capture_frame(self) -> np.ndarray:
+        raise NotImplementedError
+
+    def close(self):
+        raise NotImplementedError
+
+
+class LitocamCameraSession(BaseCameraSession):
+    backend_name = "litocam"
+
+    def __init__(
+        self,
+        camera_number: int = 0,
+        configure_camera: bool = True,
+        timeout: float = CAPTURE_TIMEOUT,
+    ):
+        super().__init__()
+        self.camera_number = camera_number
+        self.configure_camera = configure_camera
+        self.timeout = timeout
+
+        self.ct = None
+        self.hcam = None
+        self._callback = None
+
+    def _event_callback(self, nEvent, pCallbackCtx):
+        if self.ct is not None and nEvent == self.ct.EVENT_IMAGE:
+            self.ct.image_ready.set()
+
+    def open(self):
+        self.ct = load_litocam_backend()
+
+        devices = (self.ct.LitocamDeviceV2 * self.ct.MAX_CAMERAS)()
+        count = self.ct.cam.Litocam_EnumV2(devices)
+
+        print("Number of Litocam cameras found:", count)
+
+        if count == 0:
+            raise RuntimeError("No Litocam camera found. Close LitoDigital and check the USB connection.")
+
+        for i in range(count):
+            print(f"Litocam {i}: {devices[i].displayname}, ID = {devices[i].id}")
+
+        if self.camera_number < 0 or self.camera_number >= count:
+            raise ValueError(
+                f"Invalid Litocam camera number {self.camera_number}. "
+                f"Available: 0 to {count - 1}"
             )
 
-    raise RuntimeError("Timed out waiting for a usable Litocam frame.")
+        self.hcam = self.ct.cam.Litocam_Open(devices[self.camera_number].id)
 
+        if not self.hcam:
+            raise RuntimeError("Litocam_Open failed. Make sure LitoDigital is closed.")
 
-def close_litocam(hcam):
-    """
-    Stop and close camera safely.
-    """
-    if hcam:
+        width = c_int()
+        height = c_int()
+
+        hr = self.ct.cam.Litocam_get_Size(self.hcam, byref(width), byref(height))
+        self.ct.check_hr(hr, "Litocam_get_Size")
+
+        self.width = width.value
+        self.height = height.value
+        self.name = f"Litocam {self.camera_number}: {devices[self.camera_number].displayname}"
+
+        print("Opened:", self.name)
+        print("Image size:", self.width, "x", self.height)
+
+        if self.configure_camera:
+            self.ct.configure_camera(self.hcam)
+
+        self.ct.image_ready.clear()
+
+        self._callback = self.ct.CALLBACK_TYPE(self._event_callback)
+
+        hr = self.ct.cam.Litocam_StartPullModeWithCallback(
+            self.hcam,
+            self._callback,
+            None,
+        )
+        self.ct.check_hr(hr, "Litocam_StartPullModeWithCallback")
+
+        return self
+
+    def capture_frame(self) -> np.ndarray:
+        if self.ct is None or self.hcam is None:
+            raise RuntimeError("Litocam camera is not open.")
+
+        bits = self.ct.BITS
+        row_pitch = self.ct.calc_row_pitch(self.width, bits)
+        buffer_size = row_pitch * self.height
+        buffer = (ctypes.c_ubyte * buffer_size)()
+
+        deadline = time.time() + self.timeout
+
+        while time.time() < deadline:
+            self.ct.image_ready.wait(timeout=0.5)
+            self.ct.image_ready.clear()
+
+            for _attempt in range(10):
+                info = self.ct.LitocamFrameInfoV2()
+
+                hr = self.ct.cam.Litocam_PullImageWithRowPitchV2(
+                    self.hcam,
+                    buffer,
+                    bits,
+                    row_pitch,
+                    byref(info),
+                )
+
+                code = self.ct.hr32(hr)
+
+                if code == self.ct.S_OK:
+                    return self.ct.buffer_to_frame(buffer, info.width, info.height, row_pitch)
+
+                if code == self.ct.E_PENDING:
+                    time.sleep(0.01)
+                    continue
+
+                raise RuntimeError(
+                    f"Litocam_PullImageWithRowPitchV2 failed, HRESULT = {hex(code)}"
+                )
+
+        raise RuntimeError("Timed out waiting for a usable Litocam frame.")
+
+    def close(self):
+        if self.ct is None or self.hcam is None:
+            return
+
         try:
-            ct.cam.Litocam_Stop(hcam)
+            self.ct.cam.Litocam_Stop(self.hcam)
         except Exception:
             pass
 
         try:
-            ct.cam.Litocam_Close(hcam)
+            self.ct.cam.Litocam_Close(self.hcam)
         except Exception:
             pass
 
+        self.hcam = None
+
+
+class OpenCVCameraSession(BaseCameraSession):
+    backend_name = "opencv"
+
+    def __init__(
+        self,
+        camera_number: int = 0,
+        opencv_api: str = "dshow",
+        frame_width: int | None = None,
+        frame_height: int | None = None,
+        warmup_reads: int = 5,
+    ):
+        super().__init__()
+        self.camera_number = camera_number
+        self.opencv_api = opencv_api
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.warmup_reads = warmup_reads
+        self.cap = None
+
+    def open(self):
+        api = opencv_api_preference(self.opencv_api)
+
+        self.cap = cv2.VideoCapture(self.camera_number, api)
+
+        if not self.cap.isOpened():
+            # Fallback to CAP_ANY in case the requested Windows backend fails.
+            if api != cv2.CAP_ANY:
+                self.cap.release()
+                self.cap = cv2.VideoCapture(self.camera_number, cv2.CAP_ANY)
+
+        if not self.cap.isOpened():
+            raise RuntimeError(
+                f"Could not open OpenCV camera index {self.camera_number}. "
+                "Try another index, e.g. --backend opencv --camera 1."
+            )
+
+        if self.frame_width is not None:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+        if self.frame_height is not None:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+
+        # Warm up the camera buffer/exposure.
+        last_frame = None
+        for _ in range(max(0, self.warmup_reads)):
+            ret, frame = self.cap.read()
+            if ret:
+                last_frame = frame
+
+        if last_frame is None:
+            ret, last_frame = self.cap.read()
+            if not ret:
+                raise RuntimeError("OpenCV camera opened but did not return a frame.")
+
+        self.height, self.width = last_frame.shape[:2]
+        self.name = f"OpenCV camera {self.camera_number} ({self.opencv_api})"
+
+        print("Opened:", self.name)
+        print("Image size:", self.width, "x", self.height)
+
+        return self
+
+    def capture_frame(self) -> np.ndarray:
+        if self.cap is None or not self.cap.isOpened():
+            raise RuntimeError("OpenCV camera is not open.")
+
+        ret, frame = self.cap.read()
+
+        if not ret or frame is None:
+            raise RuntimeError("Failed to capture frame from OpenCV camera.")
+
+        return frame
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
+def open_camera_session(
+    backend: str,
+    camera_number: int,
+    opencv_api: str = "dshow",
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+    litocam_configure: bool = True,
+) -> BaseCameraSession:
+    """
+    Open either a Litocam SDK camera or an OpenCV/Windows camera.
+
+    backend:
+    - "litocam": force LitoDigital/litocam.dll camera
+    - "opencv": force cv2.VideoCapture camera
+    - "auto": try Litocam first, then fall back to OpenCV
+    """
+    backend = backend.lower()
+
+    if backend == "litocam":
+        return LitocamCameraSession(
+            camera_number=camera_number,
+            configure_camera=litocam_configure,
+        ).open()
+
+    if backend == "opencv":
+        return OpenCVCameraSession(
+            camera_number = camera_number,
+            opencv_api = opencv_api,
+            frame_width = frame_width,
+            frame_height = frame_height,
+        ).open()
+
+    if backend == "auto":
+        try:
+            print("Trying Litocam backend first...")
+            return LitocamCameraSession(
+                camera_number = camera_number,
+                configure_camera = litocam_configure,
+            ).open()
+        except Exception as litocam_error:
+            print("Litocam backend unavailable or failed:")
+            print(f"  {litocam_error}")
+            print("Falling back to OpenCV/Windows camera backend...")
+
+            return OpenCVCameraSession(
+                camera_number = camera_number,
+                opencv_api = opencv_api,
+                frame_width = frame_width,
+                frame_height = frame_height,
+            ).open()
+
+    raise ValueError("backend must be one of: auto, litocam, opencv")
+
+
+def warmup_camera(camera: BaseCameraSession, warmup_frames: int = WARMUP_FRAMES):
+    print("\nWarming up camera...")
+    for i in range(warmup_frames):
+        _ = camera.capture_frame()
+        print(f"Discarded warm-up frame {i + 1}/{warmup_frames}")
 
 # ============================================================
 # ROI and image analysis helpers
@@ -307,33 +514,6 @@ def normalize_rois(rois) -> list[ROI]:
             clean.append((int(x), int(y), int(w), int(h)))
 
     return clean
-
-
-def roi_iou(roi_a, roi_b) -> float:
-    ax, ay, aw, ah = roi_a
-    bx, by, bw, bh = roi_b
-
-    ax1, ay1 = ax + aw, ay + ah
-    bx1, by1 = bx + bw, by + bh
-
-    inter_x0 = max(ax, bx)
-    inter_y0 = max(ay, by)
-    inter_x1 = min(ax1, bx1)
-    inter_y1 = min(ay1, by1)
-
-    inter_w = max(0, inter_x1 - inter_x0)
-    inter_h = max(0, inter_y1 - inter_y0)
-    inter_area = inter_w * inter_h
-
-    area_a = aw * ah
-    area_b = bw * bh
-
-    union_area = area_a + area_b - inter_area
-
-    if union_area <= 0:
-        return 0.0
-
-    return inter_area / union_area
 
 
 def resize_for_display(frame: np.ndarray, max_width: int = MAX_DISPLAY_WIDTH) -> np.ndarray:
@@ -1033,16 +1213,22 @@ def draw_dashboard(
     return display
 
 
+
 # ============================================================
 # Main live loop
 # ============================================================
 
-def run_live_focus_litocam(
+def run_live_focus(
+    backend: str = "auto",
     camera_number: int = 0,
     magnification: str = "20x",
     target_fps: float = 10.0,
     roi_mode: str = "auto",
     auto_roi_count: int = AUTO_ROI_COUNT,
+    opencv_api: str = "dshow",
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+    litocam_configure: bool = True,
 ):
     if magnification not in FOCUS_TARGETS:
         raise ValueError(f"Unsupported magnification {magnification}. Choose from {list(FOCUS_TARGETS)}")
@@ -1052,19 +1238,22 @@ def run_live_focus_litocam(
 
     focus_target = FOCUS_TARGETS[magnification]
 
-    hcam = None
+    camera: BaseCameraSession | None = None
 
     try:
-        hcam, width, height = open_litocam(camera_number)
-        start_litocam_stream(hcam)
+        camera = open_camera_session(
+            backend=backend,
+            camera_number=camera_number,
+            opencv_api=opencv_api,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            litocam_configure=litocam_configure,
+        )
 
-        print("\nWarming up camera...")
-        for i in range(WARMUP_FRAMES):
-            _ = quiet_pull_one_frame(hcam, width, height)
-            print(f"Discarded warm-up frame {i + 1}/{WARMUP_FRAMES}")
+        warmup_camera(camera, WARMUP_FRAMES)
 
         print("\nCapturing baseline frame...")
-        first_frame = quiet_pull_one_frame(hcam, width, height)
+        first_frame = camera.capture_frame()
 
         if roi_mode == "auto":
             rois = auto_select_rois(first_frame, roi_count=auto_roi_count)
@@ -1086,10 +1275,12 @@ def run_live_focus_litocam(
 
         dt = 1.0 / target_fps if target_fps > 0 else 0.0
 
-        print("\nSemi-auto Litocam focus feedback started.")
+        print("\nSemi-auto focus feedback started.")
         print("Press q in the OpenCV window to quit.")
         print("Press r to reset best score.")
         print("Press a to auto-reselect ROIs.")
+        print(f"Backend: {camera.backend_name}")
+        print(f"Camera: {camera.name}")
         print(f"Magnification: {magnification}")
         print(f"Focus target: {focus_target:.2f}")
         print(f"ROI mode: {roi_mode}")
@@ -1098,7 +1289,7 @@ def run_live_focus_litocam(
         while True:
             loop_start = time.perf_counter()
 
-            frame = quiet_pull_one_frame(hcam, width, height)
+            frame = camera.capture_frame()
 
             raw_score = calculate_multi_roi_focus_score(frame, rois)
             previous_ema_score = ema_score
@@ -1134,6 +1325,19 @@ def run_live_focus_litocam(
                 scores=scores,
             )
 
+            # Add backend/camera label near the lower left.
+            backend_label = f"Backend: {camera.backend_name} | Camera: {camera.name}"
+            cv2.putText(
+                display,
+                backend_label,
+                (20, max(30, display.shape[0] - 25)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
             cv2.imshow(WINDOW_NAME, display)
 
             elapsed = time.perf_counter() - loop_start
@@ -1158,9 +1362,29 @@ def run_live_focus_litocam(
                 print("Auto ROI reselection complete. Score history and stability count reset.")
 
     finally:
-        close_litocam(hcam)
+        if camera is not None:
+            camera.close()
+
         cv2.destroyAllWindows()
         print("Camera closed.")
+
+
+# Backward-compatible function name from earlier versions.
+def run_live_focus_litocam(
+    camera_number: int = 0,
+    magnification: str = "20x",
+    target_fps: float = 10.0,
+    roi_mode: str = "auto",
+    auto_roi_count: int = AUTO_ROI_COUNT,
+):
+    run_live_focus(
+        backend="litocam",
+        camera_number=camera_number,
+        magnification=magnification,
+        target_fps=target_fps,
+        roi_mode=roi_mode,
+        auto_roi_count=auto_roi_count,
+    )
 
 
 # ============================================================
@@ -1169,14 +1393,52 @@ def run_live_focus_litocam(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Semi-auto live focus feedback using the Litocam CMOS sensor."
+        description="Semi-auto live focus feedback using either Litocam SDK or OpenCV/Windows cameras."
+    )
+
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        choices=["auto", "litocam", "opencv"],
+        help=(
+            "Camera backend. "
+            "litocam = LitoDigital/litocam.dll camera; "
+            "opencv = Windows/OpenCV camera; "
+            "auto = try litocam first, then opencv."
+        ),
     )
 
     parser.add_argument(
         "--camera",
         type=int,
         default=0,
-        help="Litocam SDK camera number. Usually 0. This is not the PC webcam index.",
+        help=(
+            "Camera number. For litocam, this is the Litocam SDK camera number. "
+            "For opencv, this is the cv2.VideoCapture index."
+        ),
+    )
+
+    parser.add_argument(
+        "--opencv-api",
+        type=str,
+        default="dshow",
+        choices=["any", "dshow", "msmf"],
+        help="OpenCV capture API to use when --backend opencv or auto fallback is used.",
+    )
+
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Optional requested frame width for OpenCV cameras.",
+    )
+
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Optional requested frame height for OpenCV cameras.",
     )
 
     parser.add_argument(
@@ -1191,7 +1453,7 @@ if __name__ == "__main__":
         "--fps",
         type=float,
         default=10.0,
-        help="Target display/update FPS. Litocam pull speed may limit actual FPS.",
+        help="Target display/update FPS. Actual FPS depends on camera and processing speed.",
     )
 
     parser.add_argument(
@@ -1209,21 +1471,31 @@ if __name__ == "__main__":
         help="Number of automatic ROIs to keep when --roi-mode auto is used.",
     )
 
-    # Backward-compatible shortcut from the previous version.
     parser.add_argument(
         "--no-roi",
         action="store_true",
-        help="Shortcut for --roi-mode none.",
+        help="Backward-compatible shortcut for --roi-mode none.",
+    )
+
+    parser.add_argument(
+        "--skip-litocam-config",
+        action="store_true",
+        help="Do not call configure_camera() for Litocam. Useful if camera settings were already adjusted elsewhere.",
     )
 
     args = parser.parse_args()
 
     selected_roi_mode = "none" if args.no_roi else args.roi_mode
 
-    run_live_focus_litocam(
+    run_live_focus(
+        backend=args.backend,
         camera_number=args.camera,
         magnification=args.mag,
         target_fps=args.fps,
         roi_mode=selected_roi_mode,
         auto_roi_count=args.roi_count,
+        opencv_api=args.opencv_api,
+        frame_width=args.width,
+        frame_height=args.height,
+        litocam_configure=not args.skip_litocam_config,
     )
